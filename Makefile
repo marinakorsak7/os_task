@@ -47,7 +47,7 @@ server.o: server.c kv_lib.h
 # Dependencies: kv_lib.c and kv_lib.h
 kv_lib.o: kv_lib.c kv_lib.h
 	# Compiling kv_lib.c with specified flags
-	$(COMPILER) $(COMPILER_FLAGS) -c kv_lib.c
+	$(COMPILER) $(COMPILER_FLAGS) -c kv_lib.c -I.  # Include current directory for header
 
 # Clean target: remove all generated files
 clean:
@@ -56,3 +56,4 @@ clean:
 
 # Indicate that 'all' and 'clean' are not actual files
 .PHONY: all clean
+

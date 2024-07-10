@@ -1,85 +1,82 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/un.h>
+#include <sys/stat.h>
 #include <errno.h>
+#include "kv_lib.h"
 
-#define SERVER_SOCKET_PATH "/tmp/server_socket"
-#define CLIENT_SOCKET_TEMPLATE "/tmp/client_socket_%d"
+#define SERVER_PIPE "/tmp/server.fifo"
 #define MAX_BUF_SIZE 256
 
 void print_usage(char *program_name) {
     fprintf(stderr, "Usage: %s <command>\n", program_name);
 }
 
-int create_client_socket(char *client_socket_path) {
-    snprintf(client_socket_path, MAX_BUF_SIZE, CLIENT_SOCKET_TEMPLATE, getpid());
-    int sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (sockfd == -1) {
-        perror("socket");
+int create_client_fifo(char *client_fifo) {
+    sprintf(client_fifo, "/tmp/client_%d.fifo", getpid());
+    if (mkfifo(client_fifo, 0666) == -1) {
+        perror("mkfifo");
         return -1;
     }
-    
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(struct sockaddr_un));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, client_socket_path, sizeof(addr.sun_path) - 1);
-
-    unlink(client_socket_path);
-    if (bind(sockfd, (struct sockaddr *)&addr, sizeof(struct sockaddr_un)) == -1) {
-        perror("bind");
-        close(sockfd);
-        return -1;
-    }
-
-    printf("Created client socket: %s\n", client_socket_path);
-    return sockfd;
-}
-
-int connect_to_server(int sockfd) {
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(struct sockaddr_un));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, SERVER_SOCKET_PATH, sizeof(addr.sun_path) - 1);
-
-    if (connect(sockfd, (struct sockaddr *)&addr, sizeof(struct sockaddr_un)) == -1) {
-        perror("connect");
-        return -1;
-    }
-
-    printf("Connected to server socket: %s\n", SERVER_SOCKET_PATH);
+    printf("Created client FIFO: %s\n", client_fifo);
     return 0;
 }
 
-int transmit_command(int sockfd, const char *command) {
-    if (write(sockfd, command, strlen(command) + 1) == -1) {
-        perror("write");
+int open_fifos(const char *client_fifo, int *client_fd, int *server_fd) {
+    *server_fd = open(SERVER_PIPE, O_WRONLY);
+    if (*server_fd == -1) {
+        perror("open server_fifo");
         return -1;
     }
-    printf("Transmitted command: %s\n", command);
+    printf("Opened server FIFO: %s\n", SERVER_PIPE);
+
+    *client_fd = open(client_fifo, O_RDONLY | O_NONBLOCK);
+    if (*client_fd == -1) {
+        perror("open client_fifo");
+        close(*server_fd);
+        return -1;
+    }
+    printf("Opened client FIFO: %s\n", client_fifo);
+
     return 0;
 }
 
-void receive_response(int sockfd) {
+int transmit_command(int server_fd, const char *command, const char *client_fifo) {
+    char message[MAX_BUF_SIZE];
+    snprintf(message, MAX_BUF_SIZE, "%s %s", command, client_fifo);
+    if (write(server_fd, message, strlen(message) + 1) == -1) {
+        perror("write to server_fifo");
+        return -1;
+    }
+    printf("Transmitted command: %s\n", message);
+    return 0;
+}
+
+void receive_response(int client_fd) {
     char response[MAX_BUF_SIZE];
     int bytes_received;
 
-    bytes_received = read(sockfd, response, MAX_BUF_SIZE);
-    if (bytes_received > 0) {
+    printf("Receiving response...\n");
+
+    while ((bytes_received = read(client_fd, response, MAX_BUF_SIZE)) > 0) {
         response[bytes_received] = '\0';
         printf("Server response: %s\n", response);
-    } else if (bytes_received == -1) {
+    }
+
+    if (bytes_received == -1) {
         perror("read");
+    } else if (bytes_received == 0) {
+        printf("Server closed the connection.\n");
     }
 }
 
-void cleanup(int sockfd, const char *client_socket_path) {
-    close(sockfd);
-    unlink(client_socket_path);
-    printf("Closed and removed client socket: %s\n", client_socket_path);
+void cleanup(int client_fd, const char *client_fifo) {
+    close(client_fd);
+    unlink(client_fifo);
+    printf("Closed and removed client FIFO: %s\n", client_fifo);
 }
 
 int main(int argc, char *argv[]) {
@@ -88,26 +85,30 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    char client_socket_path[MAX_BUF_SIZE];
-    int client_sockfd;
+    char client_fifo[MAX_BUF_SIZE];
+    int client_fd, server_fd;
 
-    client_sockfd = create_client_socket(client_socket_path);
-    if (client_sockfd == -1) {
+    if (create_client_fifo(client_fifo) == -1) {
         exit(EXIT_FAILURE);
     }
 
-    if (connect_to_server(client_sockfd) == -1) {
-        cleanup(client_sockfd, client_socket_path);
+    if (open_fifos(client_fifo, &client_fd, &server_fd) == -1) {
+        unlink(client_fifo);
         exit(EXIT_FAILURE);
     }
 
-    if (transmit_command(client_sockfd, argv[1]) == -1) {
-        cleanup(client_sockfd, client_socket_path);
+    if (transmit_command(server_fd, argv[1], client_fifo) == -1) {
+        cleanup(client_fd, client_fifo);
         exit(EXIT_FAILURE);
     }
 
-    receive_response(client_sockfd);
-    cleanup(client_sockfd, client_socket_path);
+    sleep(1); 
+
+    if (strncmp(argv[1], "get", 3) == 0 || strncmp(argv[1], "set", 3) == 0) {
+        receive_response(client_fd);
+    }
+
+    cleanup(client_fd, client_fifo);
 
     return 0;
 }

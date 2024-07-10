@@ -1,15 +1,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/un.h>
+#include <sys/stat.h>
 #include <signal.h>
 #include <errno.h>
+#include <pthread.h>
 #include "kv_lib.h"
 
-#define SERVER_SOCKET_PATH "/tmp/server_socket"
+#define SERVER_PIPE "/tmp/server.fifo"
 #define MAX_BUFFER_SIZE 256
 
 typedef struct {
@@ -24,7 +25,8 @@ volatile sig_atomic_t server_active = 1;
 void signal_handler(int sig) {
     (void)sig;
     server_active = 0;
-    unlink(SERVER_SOCKET_PATH);
+    unlink(SERVER_PIPE);
+    printf("Server shutting down.\n");
     exit(0);
 }
 
@@ -37,101 +39,117 @@ int search_key(const char* key) {
     return -1;
 }
 
-void process_client_request(int client_sockfd) {
-    char buffer[MAX_BUFFER_SIZE];
-    int bytes_received = read(client_sockfd, buffer, MAX_BUFFER_SIZE);
+void* process_client_request(void* arg) {
+    char* request = (char*)arg;
+    char* command = strtok(request, " ");  
+    char* key = strtok(NULL, " ");         
+    char* value = NULL;                   
+    char* client_fifo;
 
-    if (bytes_received > 0) {
-        buffer[bytes_received] = '\0';
-        printf("Processing request: %s\n", buffer);
+    if (strcmp(command, "set") == 0) {
+        value = strtok(NULL, " ");         
+        client_fifo = strtok(NULL, "");    
+    } else {
+        client_fifo = strtok(NULL, "");   
+    }
 
-        char* command = strtok(buffer, " ");
-        if (command == NULL) {
-            return;
+    if (command == NULL || key == NULL || client_fifo == NULL) {
+        fprintf(stderr, "Invalid request format\n");
+        free(request);
+        return NULL;
+    }
+
+    printf("Processing request: %s %s %s %s\n", command, key, value ? value : "(no value)", client_fifo);
+
+    if (access(client_fifo, F_OK) != -1) {
+        int client_fd = open(client_fifo, O_WRONLY);
+        if (client_fd == -1) {
+            perror("open client_fifo");
+            free(request);
+            return NULL;
         }
 
-        if (strcmp(command, "set") == 0) {
-            char* key = strtok(NULL, " ");
-            char* value = strtok(NULL, "\n");
-            if (key != NULL && value != NULL) {
-                int index = search_key(key);
-                if (index == -1) {
+        char response[MAX_BUFFER_SIZE];
+        if (strcmp(command, "set") == 0 && value != NULL) {
+            int index = search_key(key);
+            if (index == -1) {
+                if (kv_count < 100) {
                     strcpy(kv_store[kv_count].key, key);
                     strcpy(kv_store[kv_count].value, value);
                     kv_count++;
+                    snprintf(response, MAX_BUFFER_SIZE, "Key: %s set to Value: %s", key, value);
                 } else {
-                    strcpy(kv_store[index].value, value);
+                    snprintf(response, MAX_BUFFER_SIZE, "Key-value store is full");
                 }
-                printf("Set key: %s, value: %s\n", key, value);
-                write(client_sockfd, "OK", 3);
+            } else {
+                strcpy(kv_store[index].value, value);
+                snprintf(response, MAX_BUFFER_SIZE, "Updated Key: %s with Value: %s", key, value);
             }
         } else if (strcmp(command, "get") == 0) {
-            char* key = strtok(NULL, "\n");
-            if (key != NULL) {
-                int index = search_key(key);
-                char response[MAX_BUFFER_SIZE];
-                if (index == -1) {
-                    snprintf(response, sizeof(response), "Key not found");
-                } else {
-                    snprintf(response, sizeof(response), "Value: %s", kv_store[index].value);
-                }
-                write(client_sockfd, response, strlen(response) + 1);
-                printf("Get key: %s, response: %s\n", key, response);
+            int index = search_key(key);
+            if (index == -1) {
+                snprintf(response, MAX_BUFFER_SIZE, "Key not found");
+            } else {
+                snprintf(response, MAX_BUFFER_SIZE, "Value: %s", kv_store[index].value);
             }
         }
+
+        if (write(client_fd, response, strlen(response) + 1) == -1) {
+            perror("write to client_fifo");
+        }
+
+        close(client_fd);
+    } else {
+        printf("Client FIFO does not exist: %s\n", client_fifo);
     }
 
-    close(client_sockfd);
+    free(request);
+    return NULL;
 }
 
+
+
+
 void cleanup() {
-    unlink(SERVER_SOCKET_PATH);
+    unlink(SERVER_PIPE);
 }
 
 int main() {
     signal(SIGTERM, signal_handler);
 
-    int server_sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (server_sockfd == -1) {
-        perror("socket");
+    if (mkfifo(SERVER_PIPE, 0666) == -1) {
+        perror("mkfifo");
         exit(EXIT_FAILURE);
     }
 
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(struct sockaddr_un));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, SERVER_SOCKET_PATH, sizeof(addr.sun_path) - 1);
-
-    unlink(SERVER_SOCKET_PATH);
-    if (bind(server_sockfd, (struct sockaddr *)&addr, sizeof(struct sockaddr_un)) == -1) {
-        perror("bind");
-        close(server_sockfd);
-        exit(EXIT_FAILURE);
-    }
-
-    if (listen(server_sockfd, 5) == -1) {
-        perror("listen");
-        close(server_sockfd);
+    int server_fd = open(SERVER_PIPE, O_RDONLY | O_NONBLOCK);
+    if (server_fd == -1) {
+        perror("open server_fifo");
+        cleanup();
         exit(EXIT_FAILURE);
     }
 
     printf("Server is running...\n");
 
     while (server_active) {
-        int client_sockfd = accept(server_sockfd, NULL, NULL);
-        if (client_sockfd == -1) {
-            if (errno == EINTR) {
-                continue;
+        char buffer[MAX_BUFFER_SIZE];
+        int bytes_read = read(server_fd, buffer, MAX_BUFFER_SIZE);
+        if (bytes_read > 0) {
+            buffer[bytes_read] = '\0';
+            char* request = strdup(buffer);
+            pthread_t thread;
+            if (pthread_create(&thread, NULL, process_client_request, request) != 0) {
+                perror("pthread_create");
+                free(request);
             } else {
-                perror("accept");
-                break;
+                pthread_detach(thread);
             }
+        } else if (bytes_read == -1 && errno != EAGAIN) {
+            perror("read error");
         }
-
-        process_client_request(client_sockfd);
     }
 
-    close(server_sockfd);
+    close(server_fd);
     cleanup();
     return 0;
 }
